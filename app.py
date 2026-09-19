@@ -77,6 +77,7 @@ def extract_sql_query(content: str, thinking: str = "") -> str:
 def agent_pipeline(
     user_prompt: str,
     debug_mode: bool = False,
+    fast_mode: bool = True,
     status_container = None,
     response_placeholder = None
 ):
@@ -88,9 +89,12 @@ Database Schema:
 
 Write ONLY a valid SQLite SELECT query to answer the user's request.
 Guidelines:
-1. Fuzzy String Matching: Users rarely provide exact product names. Always use `LIKE '%keyword%'` with `LOWER()` on text fields (e.g., `LOWER(name) LIKE '%industrial pump%'`) instead of strict `=` comparisons.
-2. If multiple keywords are given, match against individual core tokens rather than demanding the entire phrase verbatim.
-3. Wrap your query in ```sql ... ``` code blocks. Do not add conversational text."""
+1. Fuzzy String Matching: Always use `LIKE '%keyword%'` with `LOWER()` on text fields (e.g., `LOWER(name) LIKE '%industrial pump%'`).
+2. Schema Details:
+   - `quotations` table uses `valid_until` DATE. For active quotations, check `valid_until >= date('now')`.
+   - `orders` table has `status` (Delivered, Processing, etc.).
+3. Reasoning Conciseness: Formulate the query directly. Once you write the query in ```sql ... ```, finish immediately without second-guessing or exploring alternate versions.
+4. Wrap your query in ```sql ... ``` code blocks."""
 
     messages = [
         {"role": "system", "content": gen_system_prompt},
@@ -121,6 +125,7 @@ Guidelines:
         accumulated_sql_thinking = ""
         accumulated_sql_content = ""
         last_th_update = time.time()
+        stopped_early = False
 
         # Stream SQL generation
         chat_stream = ollama.chat(
@@ -144,14 +149,27 @@ Guidelines:
                     thought_box.markdown(accumulated_sql_thinking + "▌")
                     last_th_update = now
 
+                # Early cutoff: If fast mode is active and the model generated a complete SQL block in thinking
+                if fast_mode and "```sql" in accumulated_sql_thinking and "```" in accumulated_sql_thinking.split("```sql", 1)[1]:
+                    stopped_early = True
+                    break
+
             if ct:
                 if accumulated_sql_content == "" and debug_mode and thought_box and accumulated_sql_thinking:
                     thought_box.markdown(accumulated_sql_thinking)
                 accumulated_sql_content += ct
 
+                # Early cutoff: If complete SQL block in content
+                if fast_mode and "```sql" in accumulated_sql_content and "```" in accumulated_sql_content.split("```sql", 1)[1]:
+                    stopped_early = True
+                    break
+
         # Finalize thought box display
         if debug_mode and thought_box and accumulated_sql_thinking:
             thought_box.markdown(accumulated_sql_thinking)
+
+        if stopped_early and debug_mode and status_container:
+            status_container.caption("⚡ *Early cutoff: Complete SQL identified. Halted subsequent rambling/second-guessing.*")
 
         # Extract SQL query
         sql_query = extract_sql_query(accumulated_sql_content, accumulated_sql_thinking)
@@ -198,17 +216,17 @@ Guidelines:
         return fail_msg, trace
 
     # 4. Final Response Synthesis with Citations
-    synthesis_prompt = f"""Synthesize the answer for the user based strictly on the retrieved database records.
+    synthesis_prompt = f"""Synthesize a natural language answer for the user based strictly on the retrieved database records.
 User Question: {user_prompt}
 Executed Query: {successful_sql}
 Retrieved Data: {final_data}
 
 Rules:
-1. Provide a natural language answer.
-2. Include explicit citations indicating which table, row ID, or columns provided the data (e.g., [Source: products table, product_id=1])."""
+1. Provide a direct, factual 1-2 sentence response.
+2. Include explicit citations indicating the source table and columns (e.g., [Source: products table (price), quotations table (customer_name)])."""
 
     synth_thought_box = None
-    if debug_mode and status_container:
+    if debug_mode and not fast_mode and status_container:
         status_container.markdown("#### 🧠 Step 2: Synthesizing Answer & Formulating Citations")
         with status_container.expander("Agent Synthesis Thought Process", expanded=True):
             st.caption("🧠 Real-time Reasoning over DB Records & Citation Formulation")
@@ -219,12 +237,14 @@ Rules:
     last_synth_th_update = time.time()
     last_synth_ct_update = time.time()
 
+    # Fast mode disables synthesis thinking to prevent the model from second-guessing citations for 2 minutes
     synth_stream = ollama.chat(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": synthesis_prompt}],
+        think=not fast_mode,
         stream=True,
         options={
-            "temperature": 0.2
+            "temperature": 0.1
         }
     )
 
@@ -233,7 +253,7 @@ Rules:
         th = getattr(msg, "thinking", None)
         ct = getattr(msg, "content", None)
 
-        if th:
+        if th and not fast_mode:
             accumulated_synth_thinking += th
             now = time.time()
             if debug_mode and synth_thought_box and (now - last_synth_th_update >= 0.04):
@@ -274,6 +294,12 @@ with st.sidebar:
         help="Stream the agent's internal thought process, generated SQL, database query execution, and auto-healing in real time."
     )
 
+    fast_mode = st.toggle(
+        "⚡ Fast Demo Mode",
+        value=True,
+        help="Early cutoff: Cuts off subsequent rambling once a valid SQL query is formed, and streamlines synthesis to avoid 2-minute second-guessing loops."
+    )
+
     st.caption(f"LLM: `{MODEL_NAME}`")
     st.divider()
 
@@ -304,7 +330,10 @@ st.title("🤖 Live Database Assistant")
 st.caption("Local Text-to-SQL with Autonomous Agentic Error Correction & Real-Time Thought Streaming")
 
 if debug_mode:
-    st.info("🐞 **Debug Mode Active:** The agent's step-by-step reasoning monologue, SQL queries, and DB results will stream live below.", icon="ℹ️")
+    status_text = "🐞 **Debug Mode Active:** Streaming live thought process, SQL queries, and DB results."
+    if fast_mode:
+        status_text += " *(⚡ Fast Demo Mode enabled: Early cutoff active to prevent rambling)*"
+    st.info(status_text, icon="ℹ️")
 
 # Query input using session state
 user_input = st.text_input(
@@ -329,6 +358,7 @@ if submit_clicked and user_input.strip():
         answer, trace_log = agent_pipeline(
             user_prompt=user_input.strip(),
             debug_mode=True,
+            fast_mode=fast_mode,
             status_container=status_box,
             response_placeholder=response_placeholder
         )
@@ -341,6 +371,7 @@ if submit_clicked and user_input.strip():
             answer, trace_log = agent_pipeline(
                 user_prompt=user_input.strip(),
                 debug_mode=False,
+                fast_mode=fast_mode,
                 status_container=None,
                 response_placeholder=response_placeholder
             )
